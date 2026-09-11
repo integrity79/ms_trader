@@ -1,0 +1,44 @@
+{
+  "positions": {
+    "017670": {
+      "name": "SK텔레콤",
+      "entry_date": "20260910",
+      "hold_days": 3,
+      "p1": 91000,
+      "avg_price": 91000.0,
+      "shares": 16,
+      "invested": 1456000,
+      "tranches": 1
+    },
+    "012330": {
+      "name": "현대모비스",
+      "entry_date": "20260911",
+      "hold_days": 2,
+      "p1": 415333.3,
+      "avg_price": 415333.3,
+      "shares": 3,
+      "invested": 1246000,
+      "tranches": 1
+    },
+    "068270": {
+      "name": "셀트리온",
+      "entry_date": "20260911",
+      "hold_days": 2,
+      "p1": 177325,
+      "avg_price": 177325,
+      "shares": 8,
+      "invested": 1418600,
+      "tranches": 1
+    },
+    "307950": {
+      "name": "현대오토에버",
+      "entry_date": "20260911",
+      "hold_days": 2,
+      "p1": 387500,
+      "avg_price": 387500,
+      "shares": 3,
+      "invested": 1162500,
+      "tranches": 1
+    }
+  }
+}

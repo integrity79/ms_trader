@@ -1,0 +1,13 @@
+{
+  "orders": [
+    {
+      "ord_no": "0169258",
+      "ticker": "035720",
+      "requested_qty": 12,
+      "is_buy": true,
+      "accounted_qty": 0,
+      "strategy": "mid",
+      "submitted_at": "2026-09-11T14:09:27"
+    }
+  ]
+}
