@@ -16,6 +16,8 @@ POSITIONS_FILE = "trader_mid_positions.json"
 UNIVERSE_FILE = "kospi50_universe.json"
 
 class MidTermTrader:
+    strategy_name = "mid"
+
     def __init__(self, client, notifier):
         self.client = client
         self.notifier = notifier
@@ -53,6 +55,12 @@ class MidTermTrader:
         self.universe_map = self.get_or_update_kospi50()
         self._candidate_histories = {}
         self._candidate_history_date = ""
+        # 키움 조건검색식으로 신규 후보를 좁혀서(전체 유니버스 스캔 대신) 대량 호출을 줄인다.
+        # 이름으로 설정하면 CNSRLST 목록에서 seq를 찾아 캐시해둔다. 미설정/조회 실패 시에는
+        # 기존 방식(universe_map 전체 스캔)으로 자동 폴백한다.
+        self.condition_name = os.getenv("MID_CONDITION_NAME", "").strip()
+        self._condition_seq = None
+        self._condition_seq_resolved = False
 
     def load_positions(self) -> dict:
         if os.path.exists(POSITIONS_FILE):
@@ -129,24 +137,76 @@ class MidTermTrader:
                 return set()
         return set()
 
+    def _resolve_condition_seq(self):
+        """MID_CONDITION_NAME에 해당하는 조건검색식 seq를 찾아 캐시한다.
+        미설정이면 None(조건검색 미사용 모드). 설정했는데 목록 조회/이름 매칭에 실패해도
+        None을 반환하지만, 이 경우 호출부는 universe_map 전체 스캔으로 돌아가지 않고
+        "후보 없음"으로 처리해야 한다 — 조건검색을 쓰기로 한 이상 실패했다고 대량 조회로
+        되돌아가면 조건검색을 쓰는 의미(대량 호출 회피)가 없어진다."""
+        if self._condition_seq_resolved:
+            return self._condition_seq
+        self._condition_seq_resolved = True
+        if not self.condition_name:
+            return None
+        try:
+            conditions = self.client.fetch_condition_list()
+        except Exception as e:
+            print(f"⚠️ [중기형 조건검색] 목록 조회 실패, 이번 회차는 후보 없음으로 처리합니다: {e}", flush=True)
+            return None
+        for seq, name in conditions:
+            if name == self.condition_name:
+                self._condition_seq = seq
+                print(f"✅ [중기형 조건검색] '{self.condition_name}' 연결됨 (seq={seq})", flush=True)
+                return seq
+        print(f"⚠️ [중기형 조건검색] '{self.condition_name}' 조건식을 찾지 못했습니다. 이번 회차는 후보 없음으로 처리합니다.", flush=True)
+        return None
+
     def prepare_candidate_history(self):
         today_str = datetime.now().strftime("%Y%m%d")
         if self._candidate_history_date == today_str:
             return
 
+        if self.condition_name:
+            # 조건검색식을 쓰기로 한 이상 후보 발견은 항상 조건검색 결과에만 의존하므로
+            # (연결 성공/실패와 무관하게) 전체 유니버스를 미리 당겨둘 필요가 없다.
+            seq = self._resolve_condition_seq()  # seq를 미리 캐시해서 스캔 시점 지연을 줄인다.
+            self._candidate_histories = {}
+            self._candidate_history_date = today_str
+            print("[중기형 사전 적재] 조건검색 모드라 전체 유니버스 사전 적재를 건너뜁니다.", flush=True)
+            # 실제 마감 루틴(15시대) 전에 조건검색이 잘 붙어 있는지, 지금 몇 종목이 잡히는지
+            # 바로 확인할 수 있도록 한 번 미리 실행해서 매칭 건수만 보여준다(부트스트랩 시 1회뿐).
+            # 마감 루틴 시점엔 scan_new_candidates()가 그때 시세로 다시 실행하므로 결과가 달라질 수 있다.
+            if seq:
+                try:
+                    matches = self.client.run_condition_search(seq, stex_tp="K")
+                    print(f"[중기형 조건검색 미리보기] '{self.condition_name}' 현재 매칭 {len(matches)}종목: "
+                          f"{', '.join(m['ticker'] for m in matches) or '없음'}", flush=True)
+                except Exception as e:
+                    print(f"⚠️ [중기형 조건검색 미리보기] 실행 실패(마감 루틴 때 재시도됨): {e}", flush=True)
+            return
+
         start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+        total = len(self.universe_map)
+        print(f"[중기형 사전 적재] 후보 {total}종목 일봉 조회 시작", flush=True)
+        started_at = time.monotonic()
+        last_logged_at = started_at
+
         histories = {}
-        for ticker in self.universe_map:
+        for i, ticker in enumerate(self.universe_map, start=1):
             try:
-                df = stock.get_market_ohlcv_by_date(start_date, today_str, ticker)
+                df = self.client.get_daily_ohlcv(ticker, start_date, today_str)
                 if df is not None and len(df) >= 20:
                     histories[ticker] = df
             except Exception:
                 continue
+            now = time.monotonic()
+            if now - last_logged_at >= 5.0 or i == total:
+                print(f"[중기형 사전 적재] 진행 {i}/{total} ({now - started_at:.0f}초 경과)", flush=True)
+                last_logged_at = now
 
         self._candidate_histories = histories
         self._candidate_history_date = today_str
-        print(f"[중기형 사전 적재] 후보 지표용 일봉 {len(histories)}종목 준비", flush=True)
+        print(f"[중기형 사전 적재] 후보 지표용 일봉 {len(histories)}종목 준비 완료 ({time.monotonic() - started_at:.0f}초 소요)", flush=True)
 
     def scan_new_candidates(self, verbose: bool = False) -> list:
         now = datetime.now()
@@ -155,10 +215,27 @@ class MidTermTrader:
         candidates = []
         skip_counts = {"이미 보유": 0, "단기형 보유": 0, "상승 미달": 0, "이력 부족": 0, "조회 오류": 0}
 
+        # 조건검색식을 설정한 이상 후보는 항상 조건검색 결과에만 의존한다. seq 연결이나
+        # 실행 자체가 실패해도 universe_map 전체 스캔으로 되돌아가지 않고 후보 없음으로
+        # 처리한다 — 그렇지 않으면 조건검색을 쓰는 이유(대량 KRX/네이버 조회 회피)가 없어진다.
+        scan_targets = self.universe_map
+        seq = self._resolve_condition_seq()
+        if seq:
+            try:
+                matches = self.client.run_condition_search(seq, stex_tp="K")
+            except Exception as e:
+                print(f"⚠️ [중기형 조건검색] 실행 실패, 이번 회차는 후보 없음으로 처리합니다: {e}", flush=True)
+                scan_targets = {}
+            else:
+                scan_targets = {m["ticker"]: (m["name"] or self.universe_map.get(m["ticker"], m["ticker"])) for m in matches}
+                print(f"[중기형 조건검색] '{self.condition_name}' 매칭 {len(scan_targets)}종목", flush=True)
+        elif self.condition_name:
+            scan_targets = {}
+
         # 단기형에서 이미 보유 중인 종목 세트 조회
         short_held_tickers = self.get_short_positions_tickers()
 
-        for ticker, name in self.universe_map.items():
+        for ticker, name in scan_targets.items():
             # 1) 중기형 본인이 이미 들고 있으면 패스
             if ticker in self.positions:
                 skip_counts["이미 보유"] += 1
@@ -183,7 +260,7 @@ class MidTermTrader:
 
                 df_hist = self._candidate_histories.get(ticker)
                 if df_hist is None:
-                    df_hist = stock.get_market_ohlcv_by_date(dt_20, today_str, ticker)
+                    df_hist = self.client.get_daily_ohlcv(ticker, dt_20, today_str)
                 if len(df_hist) < 20:
                     skip_counts["이력 부족"] += 1
                     continue
@@ -221,18 +298,28 @@ class MidTermTrader:
         today_str = now.strftime("%Y%m%d")
 
         print(f"\n[중기형 Ver2 종가 근접 루틴 가동]", flush=True)
-        bal = self.client.get_account_balance()
-        total_equity = bal["total_equity"]
-        mid_budget = (total_equity * self.capital_ratio) if total_equity > 0 else 10_000_000.0
-        slot_budget = mid_budget / self.max_slots
-        tranche_budget = slot_budget / self.max_tranches
+        # 잔고 조회가 실패해도(네트워크 오류 등) 보유 종목 익절/리밸런싱 판단까지 막히면 안 되므로,
+        # 여기서 실패하면 신규/추가매수 예산만 이번 회차에 비워두고 나머지는 계속 진행한다.
+        try:
+            bal = self.client.get_account_balance()
+            total_equity = bal["total_equity"]
+            mid_budget = (total_equity * self.capital_ratio) if total_equity > 0 else 10_000_000.0
+            slot_budget = mid_budget / self.max_slots
+            tranche_budget = slot_budget / self.max_tranches
+        except Exception as e:
+            print(f"⚠️ [중기형 마감] 잔고 조회 실패로 이번 회차 신규/추가매수는 건너뜁니다: {e}", flush=True)
+            self.notifier.send_error("mid_balance_check", f"⚠️ [중기형 마감] 잔고 조회 실패로 신규/추가매수를 건너뛰었습니다: {e}")
+            mid_budget = None
+            tranche_budget = None
 
         # 1) 보유 종목 확인 및 익절/리밸런싱 처리
         closed_tickers = []
         for ticker, pos in list(self.positions.items()):
             try:
                 quote = self.client.get_current_quote(ticker)
-            except RuntimeError:
+            except RuntimeError as e:
+                print(f"❌ [중기형 청산 오류] {ticker}: {e}", flush=True)
+                self.notifier.send_error(f"mid_closing_error:{ticker}", f"🚨 [중기형 청산 오류] {ticker}: 마감 루틴에서 이 종목의 매도 판단을 건너뛰었습니다: {e}", cooldown_seconds=0)
                 continue
 
             pos["hold_days"] = int(pos.get("hold_days", 1)) + 1
@@ -255,7 +342,7 @@ class MidTermTrader:
 
             # 익절
             if close_p >= target_p:
-                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False)
+                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False, strategy=self.strategy_name)
                 if success:
                     real_exit = fill_p
                     proceeds = real_exit * fill_q * (1 - self.sell_fee_tax_rate)
@@ -281,7 +368,7 @@ class MidTermTrader:
             if pos["tranches"] >= self.max_tranches and hold_d >= self.rebalance_days and not pos.get("rebalanced", False):
                 sell_qty = int(shares * 0.5)
                 if sell_qty > 0:
-                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, sell_qty, price=0, is_buy=False)
+                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, sell_qty, price=0, is_buy=False, strategy=self.strategy_name)
                     if success:
                         pos["shares"] -= fill_q
                         pos["invested"] = pos["shares"] * avg_p
@@ -298,17 +385,25 @@ class MidTermTrader:
             # 턴어라운드 추가 매수
             if pos["tranches"] < self.max_tranches:
                 curr_low = quote["low_price"]
-                if curr_low < pos.get("local_low", avg_p):
+                # curr_low<=0은 실시간 체결에 저가 필드가 아직 없어 캐시가 비어있는 경우다.
+                # 이 값을 그대로 반영하면 local_low가 0으로 영구 저장되어(JSON에 저장됨) 이후
+                # is_deep이 항상 참이 되는 상태로 포지션이 고착되므로 반드시 걸러야 한다.
+                if curr_low > 0 and curr_low < pos.get("local_low", avg_p):
                     pos["local_low"] = curr_low
 
                 is_deep = (pos["local_low"] <= avg_p * (1 - self.tranche_drop_threshold))
-                is_rebound = (close_p >= pos["local_low"] * (1 + self.rebound_trigger_rate)) and (close_p > quote["open_price"])
+                # open_price도 같은 이유로 0이면 "오늘 양봉" 조건이 무의미하게 항상 참이 되므로 같이 걸러준다.
+                is_rebound = (
+                    quote["open_price"] > 0
+                    and close_p >= pos["local_low"] * (1 + self.rebound_trigger_rate)
+                    and close_p > quote["open_price"]
+                )
 
-                if is_deep and is_rebound:
+                if is_deep and is_rebound and tranche_budget is not None:
                     next_tr = pos["tranches"] + 1
                     add_shares = int(tranche_budget // close_p) if close_p > 0 else 0
                     if add_shares > 0:
-                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True)
+                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True, strategy=self.strategy_name)
                         if success:
                             real_fill = fill_p if fill_p > 0 else close_p
                             real_q = fill_q if fill_q > 0 else add_shares
@@ -327,17 +422,20 @@ class MidTermTrader:
                 del self.positions[t]
         if closed_tickers:
             self.save_positions()
+            self.client.update_quote_subscription(remove=closed_tickers)
 
         # STEP 2: 신규 매수 대상 탐색
         open_slots = self.max_slots - len(self.positions)
-        chosen = self.scan_new_candidates()[:open_slots] if open_slots > 0 else []
+        # verbose=True로 종목별 판단 근거(낙폭/기준 등)와 스캔 요약을 그대로 출력한다.
+        # test_candidate_scan.py에서 쓰는 것과 동일한 메시지라 실전 로그에서도 왜 채택/탈락했는지 바로 보인다.
+        chosen = self.scan_new_candidates(verbose=True)[:open_slots] if open_slots > 0 and tranche_budget is not None else []
 
         for c in chosen:
             ticker = c["ticker"]
             price = c["price"]
             buy_shares = int(tranche_budget // price) if price > 0 else 0
             if buy_shares > 0:
-                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, buy_shares, price=0, is_buy=True)
+                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, buy_shares, price=0, is_buy=True, strategy=self.strategy_name)
                 if success:
                     real_p = fill_p if fill_p > 0 else price
                     real_q = fill_q if fill_q > 0 else buy_shares
@@ -353,6 +451,7 @@ class MidTermTrader:
                         "rebalanced": False
                     }
                     self.save_positions()
+                    self.client.update_quote_subscription(add=[ticker])
                     target_10 = int(real_p * (1 + self.early_target_rate))
                     msg = f"✨ [중기형 1차 신규매수] {c['name']} ({ticker}) @ {real_p:,}원 | 목표: {target_10:,}원"
                     print(msg, flush=True)
@@ -360,7 +459,8 @@ class MidTermTrader:
 
         # 텔레그램 일일 브리핑 발송
         summary = [f"📊 [중기형 Ver2 일일 브리핑] {today_str}"]
-        summary.append(f"• 운용 슬롯: {len(self.positions)}/{self.max_slots}개 (할당자산: {mid_budget:,.0f}원)")
+        budget_text = f"{mid_budget:,.0f}원" if mid_budget is not None else "조회 실패"
+        summary.append(f"• 운용 슬롯: {len(self.positions)}/{self.max_slots}개 (할당자산: {budget_text})")
         for tk, p in self.positions.items():
             summary.append(f" - {p['name']}: {p['tranches']}/5차 | {p['hold_days']}일차 | 평단 {int(p['avg_price']):,}원")
         if not self.positions:

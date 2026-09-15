@@ -17,6 +17,8 @@ from state_store import atomic_write_json
 POSITIONS_FILE = "trader_short_positions.json"
 
 class ShortTermTrader:
+    strategy_name = "short"
+
     def __init__(self, client, notifier):
         self.client = client
         self.notifier = notifier
@@ -42,6 +44,12 @@ class ShortTermTrader:
         self.positions = self.load_positions()
         self._candidate_histories = {}
         self._candidate_history_date = ""
+        # 키움 조건검색식으로 신규 후보를 좁혀서(전체 유니버스 스캔 대신) 대량 호출을 줄인다.
+        # 이름으로 설정하면 CNSRLST 목록에서 seq를 찾아 캐시해둔다. 미설정/조회 실패 시에는
+        # 기존 방식(fetch_universe 전체 스캔)으로 자동 폴백한다.
+        self.condition_name = os.getenv("SHORT_CONDITION_NAME", "").strip()
+        self._condition_seq = None
+        self._condition_seq_resolved = False
 
     def load_positions(self) -> dict:
         if os.path.exists(POSITIONS_FILE):
@@ -78,7 +86,7 @@ class ShortTermTrader:
         for i in range(10):
             dt_str = (today - timedelta(days=i)).strftime("%Y%m%d")
             try:
-                df = stock.get_market_ohlcv_by_date(dt_str, dt_str, "005930")
+                df = self.client.get_daily_ohlcv("005930", dt_str, dt_str)
                 if not df.empty and df.iloc[0]["거래량"] > 0:
                     return dt_str
             except Exception:
@@ -86,12 +94,23 @@ class ShortTermTrader:
         return today.strftime("%Y%m%d")
 
     def is_trading_day(self, date_str: str) -> bool:
-        try:
-            df = stock.get_market_ohlcv_by_date(date_str, date_str, "005930")
-            return df is not None and not df.empty and int(df.iloc[0]["거래량"]) > 0
-        except Exception as e:
-            print(f"⚠️ [거래일 확인 실패] {date_str}: {e}", flush=True)
-            return False
+        """휴장일이면 False, 거래일이면 True. 네트워크 오류 등으로 확인 자체에 실패하면
+        "휴장"으로 단정하지 않도록 예외를 그대로 올린다 — 호출부가 "확인 실패(재시도 필요)"와
+        "확인된 휴장"을 구분해서 처리해야 한다.
+
+        (예전엔 pykrx/네이버로 조회했는데, KRX 로그인 세션을 네이버 조회에도 재사용하는 탓인지
+        직전에 요청이 몰린 뒤 바로 이어지는 단발성 조회가 자주 타임아웃 났다. 키움 자체
+        일봉 API(ka10081)로 바꿔서 그 문제 자체를 없앴다. 그래도 만일을 대비해 짧게 재시도한다.)"""
+        last_error = None
+        for attempt in range(3):
+            try:
+                df = self.client.get_daily_ohlcv("005930", date_str, date_str)
+                return df is not None and not df.empty and int(df.iloc[0]["거래량"]) > 0
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(3)
+        raise last_error
 
     def fetch_universe(self) -> list:
         dt = self.get_latest_trading_date()
@@ -117,32 +136,104 @@ class ShortTermTrader:
                 return set()
         return set()
 
+    def _resolve_condition_seq(self):
+        """SHORT_CONDITION_NAME에 해당하는 조건검색식 seq를 찾아 캐시한다.
+        미설정이면 None(조건검색 미사용 모드). 설정했는데 목록 조회/이름 매칭에 실패해도
+        None을 반환하지만, 이 경우 호출부는 fetch_universe() 전체 스캔으로 돌아가지 않고
+        "후보 없음"으로 처리해야 한다 — 조건검색을 쓰기로 한 이상 실패했다고 대량 조회로
+        되돌아가면 조건검색을 쓰는 의미(대량 호출 회피)가 없어진다."""
+        if self._condition_seq_resolved:
+            return self._condition_seq
+        self._condition_seq_resolved = True
+        if not self.condition_name:
+            return None
+        try:
+            conditions = self.client.fetch_condition_list()
+        except Exception as e:
+            print(f"⚠️ [단기형 조건검색] 목록 조회 실패, 이번 회차는 후보 없음으로 처리합니다: {e}", flush=True)
+            return None
+        for seq, name in conditions:
+            if name == self.condition_name:
+                self._condition_seq = seq
+                print(f"✅ [단기형 조건검색] '{self.condition_name}' 연결됨 (seq={seq})", flush=True)
+                return seq
+        print(f"⚠️ [단기형 조건검색] '{self.condition_name}' 조건식을 찾지 못했습니다. 이번 회차는 후보 없음으로 처리합니다.", flush=True)
+        return None
+
     def prepare_candidate_history(self):
         today_str = datetime.now().strftime("%Y%m%d")
         if self._candidate_history_date == today_str:
             return
 
+        if self.condition_name:
+            # 조건검색식을 쓰기로 한 이상 후보 발견은 항상 조건검색 결과에만 의존하므로
+            # (연결 성공/실패와 무관하게) 전체 유니버스를 미리 당겨둘 필요가 없다.
+            seq = self._resolve_condition_seq()  # seq를 미리 캐시해서 스캔 시점 지연을 줄인다.
+            self._candidate_histories = {}
+            self._candidate_history_date = today_str
+            print("[단기형 사전 적재] 조건검색 모드라 전체 유니버스 사전 적재를 건너뜁니다.", flush=True)
+            # 실제 마감 루틴(15시대) 전에 조건검색이 잘 붙어 있는지, 지금 몇 종목이 잡히는지
+            # 바로 확인할 수 있도록 한 번 미리 실행해서 매칭 건수만 보여준다(부트스트랩 시 1회뿐).
+            # 마감 루틴 시점엔 scan_new_candidates()가 그때 시세로 다시 실행하므로 결과가 달라질 수 있다.
+            if seq:
+                try:
+                    matches = self.client.run_condition_search(seq, stex_tp="K")
+                    print(f"[단기형 조건검색 미리보기] '{self.condition_name}' 현재 매칭 {len(matches)}종목: "
+                          f"{', '.join(m['ticker'] for m in matches) or '없음'}", flush=True)
+                except Exception as e:
+                    print(f"⚠️ [단기형 조건검색 미리보기] 실행 실패(마감 루틴 때 재시도됨): {e}", flush=True)
+            return
+
         start_date = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
+        universe = self.fetch_universe()
+        total = len(universe)
+        print(f"[단기형 사전 적재] 후보 {total}종목 일봉 조회 시작", flush=True)
+        started_at = time.monotonic()
+        last_logged_at = started_at
+
         histories = {}
-        for ticker in self.fetch_universe():
+        for i, ticker in enumerate(universe, start=1):
             try:
-                df = stock.get_market_ohlcv_by_date(start_date, today_str, ticker)
+                df = self.client.get_daily_ohlcv(ticker, start_date, today_str)
                 if df is not None and len(df) >= 30:
                     histories[ticker] = df
             except Exception:
                 continue
+            now = time.monotonic()
+            if now - last_logged_at >= 5.0 or i == total:
+                print(f"[단기형 사전 적재] 진행 {i}/{total} ({now - started_at:.0f}초 경과)", flush=True)
+                last_logged_at = now
 
         self._candidate_histories = histories
         self._candidate_history_date = today_str
-        print(f"[단기형 사전 적재] 후보 지표용 일봉 {len(histories)}종목 준비", flush=True)
+        print(f"[단기형 사전 적재] 후보 지표용 일봉 {len(histories)}종목 준비 완료 ({time.monotonic() - started_at:.0f}초 소요)", flush=True)
 
     def scan_new_candidates(self, verbose: bool = False) -> list:
         now = datetime.now()
         today_str = now.strftime("%Y%m%d")
         start_date = (now - timedelta(days=90)).strftime("%Y%m%d")
-        tickers = self.fetch_universe()
         candidates = []
         skip_counts = {"이미 보유": 0, "중기형 보유": 0, "이력 부족": 0, "조회 오류": 0}
+
+        # 조건검색식을 설정한 이상 후보는 항상 조건검색 결과에만 의존한다. seq 연결이나
+        # 실행 자체가 실패해도 fetch_universe() 전체 스캔으로 되돌아가지 않고 후보 없음으로
+        # 처리한다 — 그렇지 않으면 조건검색을 쓰는 이유(대량 KRX/네이버 조회 회피)가 없어진다.
+        condition_names = {}
+        seq = self._resolve_condition_seq()
+        if seq:
+            try:
+                matches = self.client.run_condition_search(seq, stex_tp="K")
+            except Exception as e:
+                print(f"⚠️ [단기형 조건검색] 실행 실패, 이번 회차는 후보 없음으로 처리합니다: {e}", flush=True)
+                tickers = []
+            else:
+                tickers = [m["ticker"] for m in matches]
+                condition_names = {m["ticker"]: m["name"] for m in matches if m.get("name")}
+                print(f"[단기형 조건검색] '{self.condition_name}' 매칭 {len(tickers)}종목", flush=True)
+        elif self.condition_name:
+            tickers = []
+        else:
+            tickers = self.fetch_universe()
 
         # 중기형이 이미 보유 중인 종목 세트 조회
         mid_held_tickers = self.get_mid_positions_tickers()
@@ -152,19 +243,19 @@ class ShortTermTrader:
             if ticker in self.positions:
                 skip_counts["이미 보유"] += 1
                 continue
-            
+
             # 2) [신규] 중기형이 이미 보유 중인 종목이면 충돌 방지를 위해 패스
             if ticker in mid_held_tickers:
                 skip_counts["중기형 보유"] += 1
                 if verbose:
-                    name = stock.get_market_ticker_name(ticker)
+                    name = condition_names.get(ticker) or stock.get_market_ticker_name(ticker)
                     print(f"ℹ️ [단기형 스킵] [{ticker} {name}] 중기형 전략에서 이미 보유 중인 종목입니다.", flush=True)
                 continue
 
             try:
                 df = self._candidate_histories.get(ticker)
                 if df is None:
-                    df = stock.get_market_ohlcv_by_date(start_date, today_str, ticker)
+                    df = self.client.get_daily_ohlcv(ticker, start_date, today_str)
                 if df is None or len(df) < 30:
                     skip_counts["이력 부족"] += 1
                     continue
@@ -199,8 +290,8 @@ class ShortTermTrader:
                 tail_support = lower_tail >= body
                 passed = is_oversold and (stoch_gc or tail_support)
 
+                name = condition_names.get(ticker) or stock.get_market_ticker_name(ticker)
                 if verbose:
-                    name = stock.get_market_ticker_name(ticker)
                     print(
                         f"  [{ticker} {name}] RSI={curr['RSI']:.1f} 이격도={curr['이격도_20']:.1f} "
                         f"stoch_gc={stoch_gc} tail_support={tail_support} -> "
@@ -211,7 +302,7 @@ class ShortTermTrader:
                 if passed:
                     candidates.append({
                         "ticker": ticker,
-                        "name": stock.get_market_ticker_name(ticker),
+                        "name": name,
                         "price": quote["current_price"],
                         "rsi": float(curr["RSI"]),
                         "disparity": float(curr["이격도_20"]),
@@ -235,9 +326,16 @@ class ShortTermTrader:
         if not self.positions:
             return
 
-        bal = self.client.get_account_balance()
-        total_equity = bal["total_equity"] * self.capital_ratio
-        slot_budget = total_equity / self.max_slots if total_equity > 0 else 2_500_000
+        # 잔고 조회가 실패해도(네트워크 오류 등) 익절/손절 판단까지 막히면 안 되므로,
+        # 여기서 실패하더라도 추가매수 예산(slot_budget)만 이번 주기에 비워두고 계속 진행한다.
+        try:
+            bal = self.client.get_account_balance()
+            total_equity = bal["total_equity"] * self.capital_ratio
+            slot_budget = total_equity / self.max_slots if total_equity > 0 else 2_500_000
+        except Exception as e:
+            print(f"⚠️ [단기형 감시] 잔고 조회 실패로 이번 주기 추가매수는 건너뜁니다: {e}", flush=True)
+            self.notifier.send_error("short_balance_check", f"⚠️ [단기형 감시] 잔고 조회 실패로 추가매수를 건너뛰고 있습니다: {e}")
+            slot_budget = None
 
         closed_tickers = []
         for ticker, pos in list(self.positions.items()):
@@ -253,7 +351,7 @@ class ShortTermTrader:
 
                 # 목표가 익절
                 if curr_price >= target_p:
-                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False)
+                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False, strategy=self.strategy_name)
                     if success:
                         real_exit = fill_p
                         proceeds = real_exit * fill_q * (1 - self.sell_fee_tax_rate)
@@ -279,12 +377,14 @@ class ShortTermTrader:
                     continue
 
                 # 2차 추가 매수
+                # low_price<=0은 실시간 체결에 저가 필드가 아직 없어 캐시가 비어있는 경우로,
+                # 실제 급락이 아니라 데이터 공백이므로 트리거로 오인하면 안 된다.
                 trigger_2nd = int(pos["p1"] * 0.95)
-                if tranches == 1 and low_price <= trigger_2nd:
+                if tranches == 1 and slot_budget is not None and low_price > 0 and low_price <= trigger_2nd:
                     add_budget = slot_budget * self.tranche_weights[1]
                     add_shares = int(add_budget // curr_price) if curr_price > 0 else 0
                     if add_shares > 0:
-                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True)
+                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True, strategy=self.strategy_name)
                         if success:
                             real_fill = fill_p
                             pos["shares"] += fill_q
@@ -300,13 +400,13 @@ class ShortTermTrader:
                             print(msg, flush=True)
                             self.notifier.send(msg)
 
-                # 3차 추가 매수
+                # 3차 추가 매수 (low_price<=0 가드는 2차와 동일한 이유)
                 trigger_3rd = int(pos["avg_price"] * 0.95)
-                if tranches == 2 and low_price <= trigger_3rd:
+                if tranches == 2 and slot_budget is not None and low_price > 0 and low_price <= trigger_3rd:
                     add_budget = slot_budget * self.tranche_weights[2]
                     add_shares = int(add_budget // curr_price) if curr_price > 0 else 0
                     if add_shares > 0:
-                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True)
+                        success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, add_shares, price=0, is_buy=True, strategy=self.strategy_name)
                         if success:
                             real_fill = fill_p
                             pos["shares"] += fill_q
@@ -324,12 +424,14 @@ class ShortTermTrader:
 
             except Exception as e:
                 print(f"❌ [단기형 감시 오류] {ticker}: {e}", flush=True)
+                self.notifier.send_error(f"short_monitor_error:{ticker}", f"⚠️ [단기형 감시 오류] {ticker}: {e}")
 
         for t in closed_tickers:
             if t in self.positions:
                 del self.positions[t]
         if closed_tickers:
             self.save_positions()
+            self.client.update_quote_subscription(remove=closed_tickers)
 
     def run_closing_routine(self):
         """15:10 장마감 루틴"""
@@ -343,7 +445,7 @@ class ShortTermTrader:
         # 단기형 포지션 종가 청산 루틴 시작
         for ticker, pos in list(self.positions.items()):
             try:
-                df = stock.get_market_ohlcv_by_date(start_date, today_str, ticker)
+                df = self.client.get_daily_ohlcv(ticker, start_date, today_str)
                 if df.empty or len(df) < 25:
                     continue
 
@@ -372,7 +474,7 @@ class ShortTermTrader:
                     reason = f"30영업일 보유 기한 만료 ({hold_days}일 경과)"
 
                 if exit_triggered:
-                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False)
+                    success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, shares, price=0, is_buy=False, strategy=self.strategy_name)
                     if success:
                         real_exit = fill_p
                         proceeds = real_exit * fill_q * (1 - self.sell_fee_tax_rate)
@@ -396,11 +498,14 @@ class ShortTermTrader:
                     pos["hold_days"] = hold_days + 1
             except Exception as e:
                 print(f"❌ [단기형 청산 오류] {ticker}: {e}", flush=True)
+                self.notifier.send_error(f"short_closing_error:{ticker}", f"🚨 [단기형 청산 오류] {ticker}: 마감 루틴에서 이 종목의 매도 판단을 건너뛰었습니다: {e}", cooldown_seconds=0)
 
         for t in closed_tickers:
             if t in self.positions:
                 del self.positions[t]
         self.save_positions()
+        if closed_tickers:
+            self.client.update_quote_subscription(remove=closed_tickers)
 
         # 신규 매수
         bal = self.client.get_account_balance()
@@ -408,7 +513,9 @@ class ShortTermTrader:
         slot_budget = short_budget / self.max_slots if short_budget > 0 else 2_500_000
 
         open_slots = self.max_slots - len(self.positions)
-        chosen = self.scan_new_candidates()[:open_slots] if open_slots > 0 else []
+        # verbose=True로 종목별 판단 근거(RSI/이격도/스토캐스틱 등)와 스캔 요약을 그대로 출력한다.
+        # test_candidate_scan.py에서 쓰는 것과 동일한 메시지라 실전 로그에서도 왜 채택/탈락했는지 바로 보인다.
+        chosen = self.scan_new_candidates(verbose=True)[:open_slots] if open_slots > 0 else []
 
         for c in chosen:
             ticker = c["ticker"]
@@ -423,7 +530,7 @@ class ShortTermTrader:
             b1_shares = int(b1_budget // price) if price > 0 else 0
 
             if b1_shares > 0:
-                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, b1_shares, price=0, is_buy=True)
+                success, fill_p, fill_q = self.client.execute_and_confirm_order(ticker, b1_shares, price=0, is_buy=True, strategy=self.strategy_name)
                 if success:
                     real_price = fill_p if fill_p > 0 else price
                     real_qty = fill_q if fill_q > 0 else b1_shares
@@ -438,6 +545,7 @@ class ShortTermTrader:
                         "tranches": 1
                     }
                     self.save_positions()
+                    self.client.update_quote_subscription(add=[ticker])
                     target_p = int(real_price * (1 + self.target_profit_rate))
                     msg = (
                         f"★ [단기형 1차 신규매수] {c['name']} ({ticker})\n"
@@ -459,7 +567,13 @@ class ShortTermTrader:
     def warmup_krx_session(self):
         try:
             today_str = datetime.now().strftime("%Y%m%d")
-            stock.get_market_ohlcv_by_date(today_str, today_str, "005930")
-            print("-> [15:08 웜업 완료] KRX 세션 최신화 성공", flush=True)
+            self.client.get_daily_ohlcv("005930", today_str, today_str)
+            print("-> [15:08 웜업 완료] 키움 세션 최신화 성공", flush=True)
         except Exception:
             pass
+
+if __name__ == "__main__":
+
+    df = stock.get_market_ohlcv_by_date("20260914", "20260914", "005930")
+    print(df.head())
+

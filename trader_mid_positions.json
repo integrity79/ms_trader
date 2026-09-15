@@ -1,0 +1,50 @@
+{
+  "positions": {
+    "035720": {
+      "name": "카카오",
+      "entry_date": "20260914",
+      "hold_days": 2,
+      "p1": 34404,
+      "avg_price": 34404.0,
+      "shares": 12,
+      "invested": 412848.0,
+      "tranches": 1,
+      "rebalanced": false,
+      "local_low": 33850
+    },
+    "005930": {
+      "name": "삼성전자",
+      "entry_date": "20260914",
+      "hold_days": 2,
+      "p1": 252250,
+      "avg_price": 252250.0,
+      "shares": 1,
+      "invested": 252250.0,
+      "tranches": 1,
+      "rebalanced": false,
+      "local_low": 248500
+    },
+    "028260": {
+      "name": "삼성물산",
+      "entry_date": "20260914",
+      "hold_days": 1,
+      "shares": 1,
+      "invested": 355500.0,
+      "avg_price": 355500.0,
+      "tranches": 1,
+      "local_low": 347000,
+      "rebalanced": false
+    },
+    "018260": {
+      "name": "삼성에스디에스",
+      "entry_date": "20260914",
+      "hold_days": 0,
+      "shares": 1,
+      "invested": 218500.0,
+      "avg_price": 218500.0,
+      "tranches": 1,
+      "local_low": 218500,
+      "rebalanced": false
+    }
+  }
+}
